@@ -19,33 +19,46 @@ A stealth browser launcher designed to bypass Cloudflare and IP blocking using P
 
 ## Installation
 
-Ensure you have Python 3 installed. Install the dependencies using `pip`:
+Ensure you have Python 3 installed. It is recommended to use a virtual environment:
 
 ```bash
+# Initialize the virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Install browsers required for patchright
+patchright install
 ```
 
 *Note: This tool uses `patchright` instead of standard `playwright`.*
 
 ## Usage
 
-Run the tool by providing a target URL:
+You can run the tool using the provided shell wrapper wrapper which automatically uses the local `.venv`:
 
 ```bash
 # Basic usage
-python3 crystal_cdp.py https://perplexity.ai
+./crystal_cdp https://perplexity.ai
 
 # Force proxy usage (no direct access attempt)
-python3 crystal_cdp.py --proxy-only https://perplexity.ai
+./crystal_cdp --proxy-only https://perplexity.ai
 
 # Specify a custom proxy
-python3 crystal_cdp.py --proxy http://1.1.1.1:8080 https://perplexity.ai
+./crystal_cdp --proxy http://1.1.1.1:8080 https://perplexity.ai
 
 # Increase timeout or proxy limit
-python3 crystal_cdp.py --timeout 45 --max-proxies 10 https://perplexity.ai
+./crystal_cdp --timeout 45 --max-proxies 10 https://perplexity.ai
 
 # Verbose mode
-python3 crystal_cdp.py --verbose https://perplexity.ai
+./crystal_cdp --verbose https://perplexity.ai
+```
+
+Alternatively, you can run the python script directly inside the active virtual environment:
+```bash
+python crystal_cdp.py https://perplexity.ai
 ```
 
 ### Proxy Pool
@@ -57,7 +70,7 @@ Make sure this file is populated and updated to ensure reliable proxy fallbacks.
 
 ## Testing
 
-This project uses `pytest` for testing. To run the tests, install the test dependencies and run:
+This project uses `pytest` for testing. To run the tests, install the test dependencies and run them inside your active virtual environment:
 
 ```bash
 pip install pytest pytest-mock

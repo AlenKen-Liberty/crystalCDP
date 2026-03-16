@@ -2,6 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${CRYSTAL_CDP_PYTHON:-$HOME/scripts/openclaw-tool/.venv/bin/python}"
+PYTHON_BIN="${CRYSTAL_CDP_PYTHON:-$SCRIPT_DIR/.venv/bin/python}"
 
 exec "$PYTHON_BIN" "$SCRIPT_DIR/crystal_cdp.py" "$@"

@@ -67,7 +67,7 @@ def main() -> int:
     parser.add_argument("url", help="Target URL")
     parser.add_argument("--proxy-only", action="store_true", help="Skip direct access and use proxies only")
     parser.add_argument("--proxy", default=None, help="Specify a single proxy to use")
-    parser.add_argument("--max-proxies", type=int, default=5, help="Maximum proxies to try (default: 5)")
+    parser.add_argument("--max-proxies", type=int, default=10, help="Maximum proxies to try (default: 10)")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout per attempt in seconds (default: 30)")
     parser.add_argument("--no-stealth", action="store_true", help="Disable stealth JS injection")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")

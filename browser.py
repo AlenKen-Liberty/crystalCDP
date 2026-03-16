@@ -65,18 +65,68 @@ class Browser:
             print(f"[browser] {message}", file=sys.stderr)
 
     def kill_existing(self) -> None:
-        """Kill any existing chromium processes and remove profile locks to prevent startup issues."""
+        """
+        Aggressively kill all existing chromium processes and clean up playwright/profile locks.
+        This is necessary because playwright caches CDP connection info and will try to reuse
+        dead browser sessions, causing "Target page, context or browser has been closed" errors.
+        """
+        # Kill all chromium processes (gracefully first, then forcefully)
         try:
             subprocess.run(["pkill", "-f", "chromium"], capture_output=True, check=False)
             time.sleep(1)
+            # Force kill any remaining chromium processes
+            subprocess.run(["pkill", "-9", "-f", "chromium"], capture_output=True, check=False)
         except Exception:
             pass
 
+        # Kill chrome-related processes that may have lingering connections
+        for process_pattern in ["chrome_crashpad", "chrome_elf", ".cache/ms-playwright"]:
+            try:
+                subprocess.run(["pkill", "-9", "-f", process_pattern], capture_output=True, check=False)
+            except Exception:
+                pass
+
+        # Wait for processes to fully terminate and ports to be released
+        time.sleep(2)
+
+        # Clear only playwright connection cache (not the entire cache which contains chromium binary)
+        # The CDP connection info is cached in .playwright and registry files
+        playwright_data = Path.home() / ".playwright"
+        if playwright_data.exists():
+            try:
+                import shutil
+                shutil.rmtree(playwright_data, ignore_errors=True)
+                self._log(f"Cleared playwright connection cache: {playwright_data}")
+            except Exception as e:
+                self._log(f"Failed to clear playwright cache: {e}")
+
+        # Remove all profile lock files
         for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
             try:
                 (self.profile_dir / lock_file).unlink(missing_ok=True)
             except Exception:
                 pass
+
+        # Check for stale CDP port (9222) and kill any process using it
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", ":9222"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split("\n")
+                for pid in pids:
+                    try:
+                        subprocess.run(["kill", "-9", pid], capture_output=True, check=False)
+                    except Exception:
+                        pass
+                self._log(f"Killed processes on CDP port 9222: {pids}")
+        except Exception:
+            pass
+
+        time.sleep(1)
 
     def launch(self) -> None:
         """

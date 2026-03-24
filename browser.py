@@ -1,16 +1,25 @@
 import os
-import subprocess
+import shutil
 import sys
-import time
-from pathlib import Path
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-try:
-    from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-except Exception:  # pragma: no cover
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-from stealth import PageStatus, detect_page_status, inject_stealth_scripts, make_google_referer, solve_turnstile
+from playwright_backend import (
+    BACKEND_NAME,
+    PERSISTENT_PROFILE_BACKEND_NAME,
+    PersistentProfileTimeoutError,
+    PlaywrightTimeoutError,
+    persistent_profile_sync_playwright,
+    sync_playwright,
+)
+from stealth import (
+    PageStatus,
+    detect_page_status,
+    enable_resource_filter,
+    inject_stealth_scripts,
+    make_google_referer,
+    solve_turnstile,
+)
 
 
 STEALTH_ARGS = [
@@ -24,214 +33,233 @@ STEALTH_ARGS = [
     "--no-default-browser-check",
     "--disable-background-timer-throttling",
 ]
+PERSISTENT_PROFILE_ARGS = [
+    "--disable-dev-shm-usage",
+    "--ignore-certificate-errors",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+SYSTEM_CHROMIUM_PATH = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+
+
+@dataclass
+class BrowserFetchResult:
+    ok: bool
+    status: PageStatus
+    final_url: str
+    html: str
+    title: str
+    error: Optional[str] = None
 
 
 class Browser:
-    """Manages the lifecycle of a Patchright/Playwright chromium browser instance."""
-    
     def __init__(
         self,
         proxy: Optional[str] = None,
+        *,
         verbose: bool = False,
         stealth: bool = True,
-        profile_dir: Optional[Path] = None,
-        profile_name: str = "Default",
         display: str = ":1",
+        headless: bool = False,
+        disable_resources: bool = True,
+        locale: str = "en-US",
+        timezone_id: str = "America/New_York",
+        cookies: Optional[List[dict]] = None,
+        user_data_dir: Optional[str] = None,
+        profile_name: str = "Default",
+        cdp_url: Optional[str] = None,
     ) -> None:
-        """
-        Initialize the Browser configuration.
-        
-        Args:
-            proxy: Proxy URL to use (e.g., http://ip:port).
-            verbose: Enable verbose logging.
-            stealth: Enable stealth configurations and injections.
-            profile_dir: Path to the browser profile directory.
-            profile_name: Name of the profile to load.
-            display: X11 display to launch the browser on.
-        """
         self.proxy = proxy
         self.verbose = verbose
         self.stealth = stealth
-        self.profile_dir = profile_dir or (Path.home() / ".config" / "chromium")
-        self.profile_name = profile_name
         self.display = display
+        self.headless = headless
+        self.disable_resources = disable_resources
+        self.locale = locale
+        self.timezone_id = timezone_id
+        self.cookies = list(cookies or [])
+        self.user_data_dir = user_data_dir
+        self.profile_name = profile_name
+        self.cdp_url = cdp_url
 
         self._pw = None
+        self._browser = None
         self._context = None
+        self._page = None
+        self._timeout_error = PlaywrightTimeoutError
+        self._owns_context = True
+        self._owns_browser = True
 
     def _log(self, message: str) -> None:
-        """Log messages if verbose mode is enabled."""
         if self.verbose:
             print(f"[browser] {message}", file=sys.stderr)
 
-    def kill_existing(self) -> None:
-        """
-        Aggressively kill all existing chromium processes and clean up playwright/profile locks.
-        This is necessary because playwright caches CDP connection info and will try to reuse
-        dead browser sessions, causing "Target page, context or browser has been closed" errors.
-        """
-        # Kill all chromium processes (gracefully first, then forcefully)
-        try:
-            subprocess.run(["pkill", "-f", "chromium"], capture_output=True, check=False)
-            time.sleep(1)
-            # Force kill any remaining chromium processes
-            subprocess.run(["pkill", "-9", "-f", "chromium"], capture_output=True, check=False)
-        except Exception:
-            pass
-
-        # Kill chrome-related processes that may have lingering connections
-        for process_pattern in ["chrome_crashpad", "chrome_elf", ".cache/ms-playwright"]:
-            try:
-                subprocess.run(["pkill", "-9", "-f", process_pattern], capture_output=True, check=False)
-            except Exception:
-                pass
-
-        # Wait for processes to fully terminate and ports to be released
-        time.sleep(2)
-
-        # Clear only playwright connection cache (not the entire cache which contains chromium binary)
-        # The CDP connection info is cached in .playwright and registry files
-        playwright_data = Path.home() / ".playwright"
-        if playwright_data.exists():
-            try:
-                import shutil
-                shutil.rmtree(playwright_data, ignore_errors=True)
-                self._log(f"Cleared playwright connection cache: {playwright_data}")
-            except Exception as e:
-                self._log(f"Failed to clear playwright cache: {e}")
-
-        # Remove all profile lock files
-        for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            try:
-                (self.profile_dir / lock_file).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        # Check for stale CDP port (9222) and kill any process using it
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", ":9222"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if result.stdout.strip():
-                pids = result.stdout.strip().split("\n")
-                for pid in pids:
-                    try:
-                        subprocess.run(["kill", "-9", pid], capture_output=True, check=False)
-                    except Exception:
-                        pass
-                self._log(f"Killed processes on CDP port 9222: {pids}")
-        except Exception:
-            pass
-
-        time.sleep(1)
-
     def launch(self) -> None:
-        """
-        Launch the persistent chromium context with stealth arguments and profile.
-        Requires DISPLAY to be set correctly.
-        """
-        os.environ["DISPLAY"] = self.display
-        self.kill_existing()
-
-        self._pw = sync_playwright().start()
-        args = list(STEALTH_ARGS)
-        if self.profile_name:
-            args.append(f"--profile-directory={self.profile_name}")
-
-        self._context = self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
-            channel="chromium",
-            headless=False,
-            args=args,
-            proxy={"server": self.proxy} if self.proxy else None,
-            ignore_https_errors=True,
-            viewport=None,
-            no_viewport=True,
-        )
+        if not self.headless:
+            os.environ["DISPLAY"] = self.display
+        cdp_mode = bool(self.cdp_url)
+        persistent_profile = bool(self.user_data_dir) and not cdp_mode
+        backend_name = PERSISTENT_PROFILE_BACKEND_NAME if persistent_profile else BACKEND_NAME
+        sync_api = persistent_profile_sync_playwright if persistent_profile else sync_playwright
+        self._timeout_error = PersistentProfileTimeoutError if persistent_profile else PlaywrightTimeoutError
+        self._log(f"playwright backend: {backend_name}")
+        self._pw = sync_api().start()
+        launch_args = list(PERSISTENT_PROFILE_ARGS if self.user_data_dir else STEALTH_ARGS)
+        if cdp_mode:
+            self._browser = self._pw.chromium.connect_over_cdp(self.cdp_url)
+            self._owns_browser = False
+            if self._browser.contexts:
+                self._context = self._browser.contexts[0]
+                self._owns_context = False
+            else:
+                self._context = self._browser.new_context(
+                    ignore_https_errors=True,
+                    locale=self.locale,
+                    timezone_id=self.timezone_id,
+                    viewport={"width": 1366, "height": 900},
+                    color_scheme="light",
+                )
+            self._page = self._context.new_page()
+        elif self.user_data_dir:
+            launch_args.append(f"--profile-directory={self.profile_name}")
+            launch_kwargs = {
+                "user_data_dir": self.user_data_dir,
+                "headless": self.headless,
+                "args": launch_args,
+                "ignore_https_errors": True,
+                "locale": self.locale,
+                "timezone_id": self.timezone_id,
+                "viewport": {"width": 1366, "height": 900},
+                "color_scheme": "light",
+                "proxy": {"server": self.proxy} if self.proxy else None,
+            }
+            if SYSTEM_CHROMIUM_PATH:
+                launch_kwargs["executable_path"] = SYSTEM_CHROMIUM_PATH
+            else:
+                launch_kwargs["channel"] = "chromium"
+            self._context = self._pw.chromium.launch_persistent_context(**launch_kwargs)
+            self._page = self._context.new_page()
+        else:
+            launch_kwargs = {
+                "headless": self.headless,
+                "args": launch_args,
+                "proxy": {"server": self.proxy} if self.proxy else None,
+            }
+            if SYSTEM_CHROMIUM_PATH:
+                launch_kwargs["executable_path"] = SYSTEM_CHROMIUM_PATH
+            else:
+                launch_kwargs["channel"] = "chromium"
+            self._browser = self._pw.chromium.launch(**launch_kwargs)
+            self._context = self._browser.new_context(
+                ignore_https_errors=True,
+                locale=self.locale,
+                timezone_id=self.timezone_id,
+                viewport={"width": 1366, "height": 900},
+                color_scheme="light",
+            )
+            self._page = self._context.new_page()
         self._context.set_default_timeout(30000)
+        if self.cookies:
+            try:
+                self._context.add_cookies(self.cookies)
+            except Exception as exc:
+                self._log(f"add_cookies failed: {exc}")
+        if self.disable_resources:
+            enable_resource_filter(self._page)
+        if self.stealth:
+            inject_stealth_scripts(self._page)
 
     def get_page(self):
-        """
-        Get the currently active page in the context, or create a new one.
-        
-        Returns:
-            The playwright Page object.
-        """
+        if not self._page:
+            raise RuntimeError("Browser page not initialized")
+        return self._page
+
+    def export_cookies(self) -> List[dict]:
         if not self._context:
-            raise RuntimeError("Browser context not initialized")
-        for page in self._context.pages:
-            try:
-                if not page.is_closed():
-                    return page
-            except Exception:
-                continue
-        return self._context.new_page()
+            return []
+        try:
+            return self._context.cookies()
+        except Exception:
+            return []
 
     def navigate(self, url: str, timeout: int = 30) -> Tuple[PageStatus, Optional[str]]:
-        """
-        Navigate to a URL and wait for load state, handling stealth injections and Cloudflare bypass.
-        
-        Args:
-            url: Target URL to navigate to.
-            timeout: Navigation timeout in seconds.
-            
-        Returns:
-            Tuple containing the final PageStatus and an optional detail string (e.g. error message).
-        """
-        if not self._context:
+        if not self._page:
             raise RuntimeError("Browser not launched")
-
-        page = self.get_page()
-        if self.stealth:
-            inject_stealth_scripts(page)
 
         timeout_ms = max(1, int(timeout * 1000))
         response_status = None
         try:
-            response = page.goto(
+            response = self._page.goto(
                 url,
-                wait_until="load",
+                wait_until="domcontentloaded",
                 timeout=timeout_ms,
-                referer=make_google_referer(url),
+                referer=None if (self.user_data_dir or self.cdp_url) else make_google_referer(url),
             )
             if response is not None:
                 try:
                     response_status = response.status
                 except Exception:
                     response_status = None
-        except PlaywrightTimeoutError:
+        except self._timeout_error:
             return PageStatus.TIMEOUT, "timeout"
         except Exception as exc:
             return PageStatus.ERROR, str(exc)
 
         try:
-            page.wait_for_load_state("networkidle", timeout=5000)
+            self._page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 5000))
         except Exception:
             pass
 
-        status = detect_page_status(page, response_status)
+        status = detect_page_status(self._page, response_status)
         if status == PageStatus.CLOUDFLARE_TURNSTILE:
-            print("[!] Cloudflare Turnstile detected, solving...")
-            solved = solve_turnstile(page, timeout=min(20, timeout))
+            solved = solve_turnstile(self._page, timeout=min(20, timeout))
             if solved:
-                print("[+] Turnstile solved!")
-                status = detect_page_status(page, response_status)
+                status = detect_page_status(self._page, response_status)
             else:
                 return status, "turnstile_unsolved"
+        return status, None if status == PageStatus.SUCCESS else status.value
 
-        return status, None
+    def fetch(self, url: str, timeout: int = 30) -> BrowserFetchResult:
+        status, detail = self.navigate(url, timeout=timeout)
+        page = self.get_page()
+        html = ""
+        title = ""
+        final_url = url
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        try:
+            final_url = page.url
+        except Exception:
+            final_url = url
+        return BrowserFetchResult(
+            ok=status == PageStatus.SUCCESS,
+            status=status,
+            final_url=final_url,
+            html=html,
+            title=title,
+            error=None if status == PageStatus.SUCCESS else detail,
+        )
 
     def close(self) -> None:
-        """
-        Close the browser context and cleanly exit the playwright instance.
-        If navigation succeeds, this is typically bypassed to leave the browser running.
-        """
         try:
-            if self._context is not None:
+            if self._page is not None and self.cdp_url:
+                self._page.close()
+        except Exception:
+            pass
+        try:
+            if self._context is not None and self._owns_context:
                 self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None and self._owns_browser:
+                self._browser.close()
         except Exception:
             pass
         try:
@@ -239,5 +267,7 @@ class Browser:
                 self._pw.stop()
         except Exception:
             pass
+        self._page = None
         self._context = None
+        self._browser = None
         self._pw = None

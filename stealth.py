@@ -6,35 +6,82 @@ from typing import Optional
 from urllib.parse import urlparse
 
 
-CANVAS_NOISE_JS = """
-(function() {
-  const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-  CanvasRenderingContext2D.prototype.getImageData = function() {
-    const imageData = _origGetImageData.apply(this, arguments);
-    const data = imageData.data;
-    for (let i = 0; i < data.length; i += 4) {
-      data[i] = Math.max(0, Math.min(255, data[i] + (Math.random() < 0.1 ? (Math.random() > 0.5 ? 1 : -1) : 0)));
-      data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + (Math.random() < 0.1 ? (Math.random() > 0.5 ? 1 : -1) : 0)));
-      data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + (Math.random() < 0.1 ? (Math.random() > 0.5 ? 1 : -1) : 0)));
-    }
-    return imageData;
+STEALTH_INIT_JS = """
+(() => {
+  const patch = (obj, key, getter) => {
+    try {
+      Object.defineProperty(obj, key, { get: getter, configurable: true });
+    } catch (err) {}
   };
 
-  const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-  HTMLCanvasElement.prototype.toDataURL = function() {
-    const ctx = this.getContext('2d');
-    if (ctx) {
-      const imageData = ctx.getImageData(0, 0, this.width, this.height);
-      ctx.putImageData(imageData, 0, 0);
-    }
-    return _origToDataURL.apply(this, arguments);
+  patch(Navigator.prototype, 'webdriver', () => undefined);
+  patch(Navigator.prototype, 'languages', () => ['en-US', 'en']);
+  patch(Navigator.prototype, 'language', () => 'en-US');
+  patch(Navigator.prototype, 'plugins', () => [
+    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+  ]);
+  patch(Navigator.prototype, 'mimeTypes', () => [
+    { type: 'application/pdf' },
+    { type: 'text/pdf' },
+  ]);
+  patch(Navigator.prototype, 'maxTouchPoints', () => 0);
+  patch(Navigator.prototype, 'hardwareConcurrency', () => 8);
+  patch(Navigator.prototype, 'deviceMemory', () => 8);
+
+  if (!window.chrome) {
+    window.chrome = {};
+  }
+  if (!window.chrome.runtime) {
+    window.chrome.runtime = {};
+  }
+  if (!window.chrome.app) {
+    window.chrome.app = {
+      InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+      RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+      isInstalled: false,
+    };
+  }
+
+  const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+      parameters && parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+    );
+  }
+
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Open Source Technology Center';
+    if (parameter === 37446) return 'Mesa DRI Intel(R) UHD Graphics';
+    return getParameter.call(this, parameter);
   };
+
+  if (window.outerWidth === 0 || window.outerHeight === 0) {
+    patch(window, 'outerWidth', () => window.innerWidth);
+    patch(window, 'outerHeight', () => window.innerHeight + 72);
+  }
 })();
 """
+
+TRACKING_PATTERNS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "adsystem",
+    "adservice",
+    "segment.io",
+    "hotjar",
+)
+_CF_IFRAME_RE = re.compile(r"^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/.*")
 
 
 class PageStatus(Enum):
     SUCCESS = "success"
+    JAVASCRIPT_REQUIRED = "javascript_required"
     CLOUDFLARE_TURNSTILE = "cf_turnstile"
     CLOUDFLARE_BLOCK = "cf_block"
     IP_BLOCKED = "ip_blocked"
@@ -43,19 +90,7 @@ class PageStatus(Enum):
     ERROR = "error"
 
 
-_CF_IFRAME_RE = re.compile(r"^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/.*")
-
-
 def make_google_referer(url: str) -> str:
-    """
-    Generate a referer URL that makes the request look like it came from Google Search.
-    
-    Args:
-        url: The target URL.
-        
-    Returns:
-        A Google search URL for the target domain.
-    """
     try:
         domain = urlparse(url).netloc or urlparse(url).path.split("/")[0]
     except Exception:
@@ -64,94 +99,102 @@ def make_google_referer(url: str) -> str:
 
 
 def inject_stealth_scripts(page) -> None:
-    """
-    Inject stealth JavaScript into the given playwright page to avoid detection.
-    Current injections: Canvas fingerprint noise.
-    """
     try:
-        page.add_init_script(CANVAS_NOISE_JS)
+        page.add_init_script(STEALTH_INIT_JS)
+    except Exception:
+        pass
+
+
+def enable_resource_filter(page) -> None:
+    def handle_route(route):
+        request = route.request
+        try:
+            resource_type = request.resource_type
+            request_url = request.url.lower()
+        except Exception:
+            return route.continue_()
+        if resource_type in {"image", "media", "font"}:
+            return route.abort()
+        if any(token in request_url for token in TRACKING_PATTERNS):
+            return route.abort()
+        return route.continue_()
+
+    try:
+        page.route("**/*", handle_route)
     except Exception:
         pass
 
 
 def _safe_lower(value: Optional[str]) -> str:
-    """Safely convert a string to lowercase, handling None and exceptions."""
     try:
         return (value or "").lower()
     except Exception:
         return ""
 
 
-def detect_page_status(page, response_status: Optional[int] = None) -> PageStatus:
-    """
-    Detect the status of the current page based on content, title, and URL.
-    
-    Args:
-        page: Playwright Page object.
-        response_status: HTTP response status code.
-        
-    Returns:
-        PageStatus enum indicating the current state.
-    """
-    try:
-        title = _safe_lower(page.title())
-    except Exception:
-        title = ""
+def detect_html_status(
+    html: str,
+    url: str = "",
+    status_code: Optional[int] = None,
+    content_type: Optional[str] = None,
+) -> PageStatus:
+    content = _safe_lower(html)
+    lowered_url = _safe_lower(url)
+    lowered_type = _safe_lower(content_type)
 
-    try:
-        url = _safe_lower(page.url)
-    except Exception:
-        url = ""
-
-    try:
-        content = _safe_lower(page.content())
-    except Exception:
-        content = ""
-
-    if response_status == 429 or "too many requests" in content:
+    if status_code == 429 or "too many requests" in content:
         return PageStatus.RATE_LIMITED
-
+    if status_code in (401, 403):
+        if "cloudflare" in content or "error 1020" in content:
+            return PageStatus.CLOUDFLARE_BLOCK
+        return PageStatus.IP_BLOCKED
+    if status_code and status_code >= 500 and "just a moment" in content:
+        return PageStatus.CLOUDFLARE_TURNSTILE
     if (
-        "cf-turnstile" in content
+        "/cdn-cgi/challenge-platform/" in lowered_url
+        or "cf-turnstile" in content
         or "cf_turnstile" in content
         or "turnstile" in content
         or "checking your browser" in content
         or "verify you are human" in content
         or "verifying you are human" in content
-        or "challenge-form" in content
-        or "/cdn-cgi/challenge-platform/" in url
-        or "just a moment" in title
-        or "attention required" in title
+        or "just a moment" in content
+        or "attention required" in content
     ):
         return PageStatus.CLOUDFLARE_TURNSTILE
-
-    if (
-        "access denied" in title
-        or "access denied" in content
-        or "error 1020" in content
-        or "cf-error-code" in content
-    ):
+    if "access denied" in content or "error 1020" in content or "cf-error-code" in content:
         return PageStatus.CLOUDFLARE_BLOCK
-
-    if response_status in (401, 403):
-        return PageStatus.IP_BLOCKED
-
-    if response_status and response_status >= 400:
+    if (
+        "enable javascript" in content
+        or "javascript is required" in content
+        or "please turn javascript on" in content
+        or ("text/html" in lowered_type and "<script" in content and "<body" in content and len(content) < 5000)
+    ):
+        return PageStatus.JAVASCRIPT_REQUIRED
+    if status_code and status_code >= 400:
         return PageStatus.ERROR
-
     return PageStatus.SUCCESS
 
 
+def detect_page_status(page, response_status: Optional[int] = None) -> PageStatus:
+    try:
+        page_html = page.content()
+    except Exception:
+        page_html = ""
+    try:
+        page_url = page.url
+    except Exception:
+        page_url = ""
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+
+    status = detect_html_status(page_html + "\n" + title, page_url, response_status, "text/html")
+    return status
+
+
 def detect_turnstile_type(html: str) -> Optional[str]:
-    """
-    Detect the type of Cloudflare Turnstile challenge present in the HTML.
-    
-    Args:
-        html: HTML content of the page.
-        
-    Returns:
-        'embedded', 'interactive', 'non-interactive', or None.
-    """
     low = _safe_lower(html)
     if "<title>just a moment" not in low:
         if "cf_turnstile" in low or "cf-turnstile" in low:
@@ -167,16 +210,6 @@ def detect_turnstile_type(html: str) -> Optional[str]:
 
 
 def solve_turnstile(page, timeout: int = 20) -> bool:
-    """
-    Attempt to automatically solve Cloudflare Turnstile on the page.
-    
-    Args:
-        page: Playwright Page object.
-        timeout: Maximum time in seconds to wait for resolution.
-        
-    Returns:
-        True if solved or no challenge detected, False if timed out or failed.
-    """
     try:
         html = page.content() or ""
     except Exception:
@@ -243,6 +276,5 @@ def solve_turnstile(page, timeout: int = 20) -> bool:
             if detect_turnstile_type(cur_html) is None:
                 return True
         return False
-
     except Exception:
         return False

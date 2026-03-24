@@ -1,83 +1,124 @@
 # Crystal CDP
 
-A stealth browser launcher designed to bypass Cloudflare and IP blocking using Patchright (a stealth fork of Playwright) and intelligent proxy rotation.
+Library-first web content fetcher for internal modules.
 
-## Features
+It accepts a URL, reuses Chromium cookies when possible, trims page content for downstream LLMs, and auto-upgrades from `http` to `headless` to `headed` when lighter paths fail.
 
-- **Stealth Browsing**: Employs `patchright` and custom JavaScript injections (like Canvas noise) to evade bot detection.
-- **Cloudflare Turnstile Solver**: Automatically detects and solves Cloudflare challenges.
-- **Proxy Rotation**: Verifies and rotates proxies dynamically when direct access fails.
-- **Persistent Profiles**: Preserves user logins, cookies, and extensions by using the `Default` browser profile.
-- **Detached Execution**: Successful launches detach the browser, allowing the script to exit while you continue working in your VNC environment (`DISPLAY=:1`).
+## What It Does
 
-## Architecture
+- Primary interface: `from crystal_cdp import Crystal`
+- Default egress chain: `WARP -> Mac backup -> direct`
+- Cookie reuse from `~/.config/chromium/Default/`
+- Optional headed reuse of the real Chromium profile for login-sensitive flows
+- HTML cleanup for downstream LLMs
+- Browser fallback with headless/headed Chromium
+- `rebrowser-playwright` preferred, `patchright` / upstream `playwright` as fallback
+- Stealth patches beyond the old canvas-noise approach
 
-- `crystal_cdp.py`: CLI entry point and main orchestration loop.
-- `browser.py`: Manages the Patchright browser lifecycle, navigation, and persistent context.
-- `stealth.py`: Handles fingerprint spoofing, status detection, and automatic CAPTCHA solving.
-- `proxy_loader.py`: Retrieves and quickly validates proxies from a local proxy pool.
+## Python Usage
 
-## Installation
+Fetch content:
 
-Ensure you have Python 3 installed. It is recommended to use a virtual environment:
+```python
+from crystal_cdp import Crystal
 
-```bash
-# Initialize the virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+crystal = Crystal()
+result = crystal.fetch("https://example.com")
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install browsers required for patchright
-patchright install
+if result.ok:
+    print(result.text)
+    print(result.links[:5])
+else:
+    print(result.error)
 ```
 
-*Note: This tool uses `patchright` instead of standard `playwright`.*
+Hold a page for interaction:
 
-## Usage
+```python
+from crystal_cdp import Crystal
 
-You can run the tool using the provided shell wrapper wrapper which automatically uses the local `.venv`:
-
-```bash
-# Basic usage
-./crystal_cdp https://perplexity.ai
-
-# Force proxy usage (no direct access attempt)
-./crystal_cdp --proxy-only https://perplexity.ai
-
-# Specify a custom proxy
-./crystal_cdp --proxy http://1.1.1.1:8080 https://perplexity.ai
-
-# Increase timeout or proxy limit
-./crystal_cdp --timeout 45 --max-proxies 10 https://perplexity.ai
-
-# Verbose mode
-./crystal_cdp --verbose https://perplexity.ai
+crystal = Crystal(
+    proxy="direct",
+    mode="headed",
+    auto_upgrade=False,
+    use_persistent_profile=True,
+)
+result = crystal.open("https://voice.google.com/u/0/calls", mode="headed")
+page = result.page
 ```
 
-Alternatively, you can run the python script directly inside the active virtual environment:
-```bash
-python crystal_cdp.py https://perplexity.ai
-```
-
-### Proxy Pool
-
-The `ProxyLoader` looks for a local proxy pool file at:
-`~/scripts/openclaw-tool/proxy/proxy_pool.txt`
-
-Make sure this file is populated and updated to ensure reliable proxy fallbacks.
-
-## Testing
-
-This project uses `pytest` for testing. To run the tests, install the test dependencies and run them inside your active virtual environment:
+One-shot CLI remains available for local debugging:
 
 ```bash
-pip install pytest pytest-mock
-pytest tests/
+python3 crystal_cdp.py https://example.com --json
 ```
 
-## Contributing
+## Result Shape
 
-- Check `DESIGN.md` for full implementation details.
-- Code changes should be verified by running the test suite.
+`fetch()` returns a `FetchResult` with:
+
+- `ok`
+- `url`
+- `text`
+- `html`
+- `links`
+- `mode_used`
+- `proxy_used`
+- `elapsed_ms`
+- `error`
+- `attempts`
+
+`open()` returns an `OpenResult` with:
+
+- `ok`
+- `url`
+- `page`
+- `browser`
+- `mode_used`
+- `proxy_used`
+- `elapsed_ms`
+- `error`
+- `attempts`
+
+## Cookie Strategy
+
+1. Read `~/.config/chromium/Default/Cookies`.
+2. Reuse matching cookies for the requested host.
+3. If direct SQLite decryption fails, fall back to browser-side export from the Chromium profile.
+4. Inject cookies into HTTP headers or browser contexts.
+5. For sites that still require richer session state, `use_persistent_profile=True` lets headed mode reuse the live Chromium profile directly.
+
+`cryptography` improves Linux cookie decryption reliability. Without it, browser fallback still works for many cases.
+
+## Browser Backend
+
+The preferred backend is `rebrowser-playwright`, based on the official package description that it is intended as a drop-in replacement for Playwright. This repo still falls back to `patchright`, then upstream `playwright`, so the code can run during migration.
+
+## Stealth Strategy
+
+The old canvas-noise approach was removed. Current stealth focuses on lower-noise, higher-signal patches:
+
+- `navigator.webdriver` removal
+- `chrome.runtime` / `chrome.app` presence
+- language / plugin / mime-type normalization
+- `permissions.query()` patch for notifications
+- WebGL vendor / renderer normalization
+- resource blocking for images, fonts, media, and common trackers
+- real Chromium channel with WebRTC leak-reduction flags
+
+## Files
+
+- `crystal_cdp.py`: orchestrator, dataclasses, library entry, debug CLI
+- `playwright_backend.py`: `rebrowser-playwright` first, fallback chain
+- `http_engine.py`: curl-backed HTTP fetch path
+- `browser.py`: headless/headed browser path
+- `cookie_manager.py`: Chromium cookie extraction and cache
+- `content_cleaner.py`: HTML trimming and link extraction
+- `proxy_manager.py`: WARP / Mac / direct egress chain
+- `stealth.py`: status detection, stealth patches, Turnstile solve
+
+## Verification
+
+```bash
+python3 -m pytest -q
+```

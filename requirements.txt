@@ -1,2 +1,2 @@
-patchright>=0.5
-requests>=2.28
+rebrowser-playwright>=1.52.0
+cryptography>=42.0

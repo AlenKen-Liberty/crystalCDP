@@ -1,51 +1,119 @@
-import pytest
-from browser import Browser
-from stealth import PageStatus
 from unittest.mock import MagicMock
 
+from browser import Browser
+from stealth import PageStatus
+
+
 def test_browser_init():
-    b = Browser(proxy="http://1.2.3.4:8080", verbose=True)
-    assert b.proxy == "http://1.2.3.4:8080"
-    assert b.verbose is True
-    assert b.stealth is True
-    assert b.profile_name == "Default"
+    browser = Browser(proxy="http://1.2.3.4:8080", verbose=True, headless=True)
+    assert browser.proxy == "http://1.2.3.4:8080"
+    assert browser.verbose is True
+    assert browser.headless is True
+    assert browser.stealth is True
 
-def test_browser_launch_and_close(mocker):
-    b = Browser()
-    
-    # Mock playwright
-    mock_pw = mocker.patch("browser.sync_playwright")
-    mock_pw_instance = MagicMock()
-    mock_pw.return_value.start.return_value = mock_pw_instance
-    
-    mocker.patch.object(b, "kill_existing")
-    
-    b.launch()
-    assert b._pw is not None
-    assert b._context is not None
-    
-    b.close()
-    assert b._pw is None
-    assert b._context is None
 
-def test_browser_navigate(mocker):
-    b = Browser()
-    
-    # Setup mock context and page
-    b._context = MagicMock()
-    mock_page = MagicMock()
-    b._context.pages = [mock_page]
-    mock_page.is_closed.return_value = False
-    
-    mock_response = MagicMock()
-    mock_response.status = 200
-    mock_page.goto.return_value = mock_response
-    
-    # Mock stealth
-    mocker.patch("browser.inject_stealth_scripts")
-    mocker.patch("browser.detect_page_status", return_value=PageStatus.SUCCESS)
-    
-    status, detail = b.navigate("https://example.com")
-    assert status == PageStatus.SUCCESS
-    assert detail is None
-    mock_page.goto.assert_called_once()
+def test_browser_launch(monkeypatch):
+    browser = Browser(cookies=[{"name": "sid", "value": "1", "domain": ".example.com", "path": "/"}])
+
+    page = MagicMock()
+    context = MagicMock()
+    context.new_page.return_value = page
+    chromium_browser = MagicMock()
+    chromium_browser.new_context.return_value = context
+    playwright = MagicMock()
+    playwright.chromium.launch.return_value = chromium_browser
+    sync_api = MagicMock()
+    sync_api.start.return_value = playwright
+
+    resource_filter_calls = []
+    stealth_calls = []
+    monkeypatch.setattr("browser.sync_playwright", lambda: sync_api)
+    monkeypatch.setattr("browser.enable_resource_filter", lambda page_arg: resource_filter_calls.append(page_arg))
+    monkeypatch.setattr("browser.inject_stealth_scripts", lambda page_arg: stealth_calls.append(page_arg))
+
+    browser.launch()
+
+    chromium_browser.new_context.assert_called_once()
+    context.add_cookies.assert_called_once()
+    assert resource_filter_calls == [page]
+    assert stealth_calls == [page]
+    browser.close()
+
+
+def test_browser_launch_with_persistent_profile(monkeypatch):
+    browser = Browser(user_data_dir="/tmp/chromium", profile_name="Profile 7")
+
+    page = MagicMock()
+    context = MagicMock()
+    context.new_page.return_value = page
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context.return_value = context
+    sync_api = MagicMock()
+    sync_api.start.return_value = playwright
+
+    resource_filter_calls = []
+    stealth_calls = []
+    monkeypatch.setattr("browser.persistent_profile_sync_playwright", lambda: sync_api)
+    monkeypatch.setattr("browser.enable_resource_filter", lambda page_arg: resource_filter_calls.append(page_arg))
+    monkeypatch.setattr("browser.inject_stealth_scripts", lambda page_arg: stealth_calls.append(page_arg))
+
+    browser.launch()
+
+    playwright.chromium.launch.assert_not_called()
+    playwright.chromium.launch_persistent_context.assert_called_once()
+    _, kwargs = playwright.chromium.launch_persistent_context.call_args
+    assert kwargs["user_data_dir"] == "/tmp/chromium"
+    assert "--profile-directory=Profile 7" in kwargs["args"]
+    assert resource_filter_calls == [page]
+    assert stealth_calls == [page]
+    browser.close()
+
+
+def test_browser_launch_with_cdp(monkeypatch):
+    browser = Browser(cdp_url="http://127.0.0.1:9222")
+
+    page = MagicMock()
+    context = MagicMock()
+    context.new_page.return_value = page
+    chromium_browser = MagicMock()
+    chromium_browser.contexts = [context]
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp.return_value = chromium_browser
+    sync_api = MagicMock()
+    sync_api.start.return_value = playwright
+
+    resource_filter_calls = []
+    stealth_calls = []
+    monkeypatch.setattr("browser.sync_playwright", lambda: sync_api)
+    monkeypatch.setattr("browser.enable_resource_filter", lambda page_arg: resource_filter_calls.append(page_arg))
+    monkeypatch.setattr("browser.inject_stealth_scripts", lambda page_arg: stealth_calls.append(page_arg))
+
+    browser.launch()
+
+    playwright.chromium.connect_over_cdp.assert_called_once_with("http://127.0.0.1:9222")
+    chromium_browser.close.assert_not_called()
+    assert resource_filter_calls == [page]
+    assert stealth_calls == [page]
+    browser.close()
+    page.close.assert_called_once()
+
+
+def test_browser_fetch(monkeypatch):
+    browser = Browser(headless=True)
+    page = MagicMock()
+    browser._page = page
+
+    response = MagicMock()
+    response.status = 200
+    page.goto.return_value = response
+    page.content.return_value = "<main>Hello</main>"
+    page.title.return_value = "Hello"
+    page.url = "https://example.com"
+
+    monkeypatch.setattr("browser.detect_page_status", lambda *args, **kwargs: PageStatus.SUCCESS)
+
+    result = browser.fetch("https://example.com")
+
+    assert result.ok is True
+    assert result.status == PageStatus.SUCCESS
+    assert result.final_url == "https://example.com"
